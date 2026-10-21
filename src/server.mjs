@@ -3,21 +3,23 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "./store.mjs";
-import { assessment, fallbackPlan, inviteBody, validate } from "./interview.mjs";
+import { assessment, fallbackPlan, inviteBody, validate, validateSchedule } from "./interview.mjs";
+import { accessToken, assertRequestTenant, loadConfig } from "./config.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const port = Number(process.env.PORT || 3000);
-const store = new Store(path.resolve(process.env.DATA_DIR || path.join(root, "data")));
+const config = loadConfig();
+const store = new Store(path.resolve(config.dataDir.startsWith(".") ? path.join(root, config.dataDir) : config.dataDir));
 await store.init();
 const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
 
 async function body(req) {
   let value = "";
   for await (const chunk of req) { value += chunk; if (value.length > 1000000) throw Object.assign(new Error("Request too large"), { status: 413 }); }
-  return value ? JSON.parse(value) : {};
+  try { return value ? JSON.parse(value) : {}; }
+  catch { throw Object.assign(new Error("Request body must be valid JSON."), { status: 400 }); }
 }
 function send(res, status, value) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "same-origin" });
   res.end(JSON.stringify(value));
 }
 
@@ -34,7 +36,7 @@ async function generatePlan(input) {
       { role: "user", content: JSON.stringify(input) }
     ]
   }) });
-  if (!response.ok) throw new Error(`Azure OpenAI returned ${response.status}: ${await response.text()}`);
+  if (!response.ok) throw new Error(`Azure OpenAI plan generation failed with status ${response.status}.`);
   const payload = await response.json();
   return { ...JSON.parse(payload.choices[0].message.content), generatedBy: "azure-openai" };
 }
@@ -43,19 +45,21 @@ async function graphEvent(token, interview) {
   const event = {
     subject: `AI Interview - ${interview.jobTitle}`,
     body: { contentType: "HTML", content: inviteBody(interview) },
-    start: { dateTime: interview.startDateTime, timeZone: interview.timeZone || "UTC" },
-    end: { dateTime: interview.endDateTime, timeZone: interview.timeZone || "UTC" },
+    start: { dateTime: interview.startDateTime, timeZone: interview.timeZone },
+    end: { dateTime: interview.endDateTime, timeZone: interview.timeZone },
     attendees: [{ emailAddress: { address: interview.candidateEmail, name: interview.candidateName }, type: "required" }],
     isOnlineMeeting: true, onlineMeetingProvider: "teamsForBusiness", allowNewTimeProposals: true
   };
   const response = await fetch("https://graph.microsoft.com/v1.0/me/events", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(event) });
-  if (!response.ok) throw new Error(`Microsoft Graph returned ${response.status}: ${await response.text()}`);
+  if (!response.ok) throw new Error(`Microsoft Graph scheduling failed with status ${response.status}.`);
   return response.json();
 }
 
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  if (req.method === "GET" && url.pathname === "/api/health") return send(res, 200, { status: "ok", service: "AI Interviewer", time: new Date().toISOString() });
+  if (req.method === "GET" && url.pathname === "/api/health") return send(res, 200, { status: "ok", service: "AI Interviewer", time: new Date().toISOString(), environment: config.safeMetadata() });
+  if (url.pathname.startsWith("/api/")) assertRequestTenant(req.headers, config);
+
   if (req.method === "POST" && url.pathname === "/api/interviews/plan") {
     const input = await body(req); const errors = validate(input);
     if (errors.length) return send(res, 400, { errors });
@@ -65,9 +69,10 @@ async function route(req, res) {
   const match = url.pathname.match(/^\/api\/interviews\/([a-f0-9-]+)(?:\/(schedule|transcript|approve))?$/i);
   if (match && req.method === "GET" && !match[2]) return send(res, 200, await store.get(match[1]));
   if (match && req.method === "POST" && match[2] === "schedule") {
-    const record = await store.get(match[1]); const input = await body(req);
-    const token = req.headers["x-ms-token-aad-access-token"] || req.headers.authorization?.replace(/^Bearer /i, "");
-    if (!token && process.env.ALLOW_MOCK_GRAPH !== "true") return send(res, 401, { error: "Microsoft Graph delegated token missing. Sign in through App Service Authentication." });
+    const record = await store.get(match[1]); const input = await body(req); const errors = validateSchedule(input);
+    if (errors.length) return send(res, 400, { errors });
+    const token = accessToken(req.headers);
+    if (!token && !config.allowMockGraph) return send(res, 401, { error: "Microsoft Graph delegated token missing. Sign in through App Service Authentication." });
     const event = token ? await graphEvent(token, { ...input, jobTitle: record.plan.jobTitle }) : { id: `mock-${Date.now()}`, webLink: "#mock", onlineMeeting: { joinUrl: "https://teams.microsoft.com/l/meetup-join/mock" }, note: "Mock event only" };
     Object.assign(record, { candidate: input, graphEvent: event, status: "SCHEDULED" }); record.audit.push({ at: new Date().toISOString(), action: "MEETING_SCHEDULED", graphEventId: event.id }); await store.save(record); return send(res, 200, record);
   }
@@ -82,10 +87,10 @@ async function route(req, res) {
   if (req.method === "GET") {
     const file = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, ""); const target = path.join(root, "public", path.normalize(file));
     if (!target.startsWith(path.join(root, "public"))) return send(res, 403, { error: "Forbidden" });
-    try { const content = await readFile(target); res.writeHead(200, { "content-type": mime[path.extname(target)] || "application/octet-stream", "x-content-type-options": "nosniff" }); return res.end(content); } catch { return send(res, 404, { error: "Not found" }); }
+    try { const content = await readFile(target); res.writeHead(200, { "content-type": mime[path.extname(target)] || "application/octet-stream", "x-content-type-options": "nosniff", "referrer-policy": "same-origin" }); return res.end(content); } catch { return send(res, 404, { error: "Not found" }); }
   }
   return send(res, 404, { error: "Not found" });
 }
 
 const server = http.createServer((req, res) => route(req, res).catch(error => { console.error(error); send(res, error.status || 500, { error: error.message || "Unexpected error" }); }));
-server.listen(port, "0.0.0.0", () => console.log(`AI Interviewer listening on http://0.0.0.0:${port}`));
+server.listen(config.port, "0.0.0.0", () => console.log(`AI Interviewer listening on http://0.0.0.0:${config.port} (${config.deploymentMode}/${config.dataMode})`));
