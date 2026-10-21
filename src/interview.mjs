@@ -25,6 +25,20 @@ export function validate(input) {
   return errors;
 }
 
+export function validateSchedule(input) {
+  const errors = [];
+  if (!input?.candidateName?.trim()) errors.push("Candidate name is required.");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(input?.candidateEmail || ""))) errors.push("A valid candidate email is required.");
+  const start = Date.parse(input?.startDateTime);
+  const end = Date.parse(input?.endDateTime);
+  if (!Number.isFinite(start)) errors.push("A valid start date and time is required.");
+  if (!Number.isFinite(end)) errors.push("A valid end date and time is required.");
+  if (Number.isFinite(start) && Number.isFinite(end) && end <= start) errors.push("End time must be after start time.");
+  if (Number.isFinite(start) && Number.isFinite(end) && end - start > 120 * 60 * 1000) errors.push("Interview duration cannot exceed 120 minutes.");
+  if (!input?.timeZone?.trim()) errors.push("Time zone is required.");
+  return errors;
+}
+
 export function fallbackPlan(input) {
   return {
     jobTitle: input.jobTitle.trim(), durationMinutes: Number(input.durationMinutes), language: "English", mode: "Transcript only",
